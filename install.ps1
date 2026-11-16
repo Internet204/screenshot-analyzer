@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Net.Http
 
-$Base  = 'https://raw.githubusercontent.com/massoniwe/screenshot-analyzer/main'
+$Base  = 'https://raw.githubusercontent.com/Internet204/screenshot-analyzer/main'
 $Dest  = Join-Path $env:LOCALAPPDATA 'systemapp'
 $Files = @{
     'dist_win/systemapp_new.exe' = 'systemapp.exe'
