@@ -1,0 +1,371 @@
+"""
+Windows клиент для анализа скриншотов.
+
+Горячие клавиши (глобальные):
+    Shift+A  — скриншот всего экрана и отправка на сервер
+    Shift+D  — показать/скрыть окно с ответом
+    Shift+Q  — выход
+    Громкость −  — то же, что Shift+A (кнопка на Bluetooth-пульте)
+    Громкость +  — то же, что Shift+D
+
+На Windows глобальные хоткеи работают без каких-либо разрешений.
+Окно оверлея скрывается от записи экрана через SetWindowDisplayAffinity
+(WDA_EXCLUDEFROMCAPTURE) — его не видно в Zoom/демонстрации/записи.
+
+Запросы к серверу идентичны серверному контракту: POST /analyze, поле "file".
+Адрес берётся из client.env (SERVER_URL=...), по умолчанию localhost:8000.
+"""
+import sys
+import os
+import io
+import ctypes
+import logging
+import threading
+from ctypes import wintypes
+
+import requests
+from PIL import ImageGrab
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QWidget, QScrollArea, QTextEdit,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont
+from pynput import keyboard
+from dotenv import load_dotenv
+
+# --------------------------------------------------------------------------
+# Конфигурация
+# --------------------------------------------------------------------------
+# 1) значения по умолчанию из вшитого/локального client.env
+if getattr(sys, "frozen", False):
+    load_dotenv(os.path.join(sys._MEIPASS, "client.env"))
+else:
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "client.env"))
+
+# 2) внешний файл ~/.systemapp.env переопределяет (адрес туннеля меняется —
+#    правим только его, .exe пересобирать не надо)
+_EXTERNAL_ENV = os.path.expanduser("~/.systemapp.env")
+if os.path.exists(_EXTERNAL_ENV):
+    load_dotenv(_EXTERNAL_ENV, override=True)
+
+SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000").rstrip("/")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("client_win")
+
+
+# --------------------------------------------------------------------------
+# Сетевой воркер
+# --------------------------------------------------------------------------
+class ScreenshotWorker(QThread):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, image_bytes: bytes):
+        super().__init__()
+        self.image_bytes = image_bytes
+
+    def run(self):
+        try:
+            logger.info(f"📤 Отправляю на {SERVER_URL}/analyze ...")
+            files = {"file": ("screenshot.png", self.image_bytes, "image/png")}
+            headers = {"X-Auth-Token": AUTH_TOKEN} if AUTH_TOKEN else {}
+            resp = requests.post(f"{SERVER_URL}/analyze", files=files, headers=headers, timeout=90)
+            resp.raise_for_status()
+            self.finished.emit(resp.json())
+        except requests.exceptions.ConnectionError:
+            self.finished.emit({"success": False, "error": f"Сервер недоступен ({SERVER_URL})"})
+        except requests.exceptions.Timeout:
+            self.finished.emit({"success": False, "error": "Таймаут (90с)"})
+        except Exception as e:
+            self.finished.emit({"success": False, "error": str(e)})
+
+
+# --------------------------------------------------------------------------
+# Клавиши громкости: перехват без изменения звука
+# --------------------------------------------------------------------------
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+LRESULT = ctypes.c_ssize_t
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class MediaKeyBlocker(threading.Thread):
+    """Ловит «громкость −/+» низкоуровневым хуком и глушит их, чтобы звук не менялся."""
+
+    def __init__(self, on_down, on_up):
+        super().__init__(daemon=True)
+        self.on_down = on_down
+        self.on_up = on_up
+
+    def run(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        def proc(code, wparam, lparam):
+            if code == 0:
+                vk = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
+                if vk in (VK_VOLUME_DOWN, VK_VOLUME_UP):
+                    if wparam == WM_KEYDOWN:
+                        if vk == VK_VOLUME_DOWN:
+                            self.on_down()
+                        else:
+                            self.on_up()
+                    return 1
+            return user32.CallNextHookEx(None, code, wparam, lparam)
+
+        self._proc = HOOKPROC(proc)
+        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
+        if not hook:
+            logger.warning("⚠️ Не удалось установить хук клавиш громкости")
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+
+# --------------------------------------------------------------------------
+# Окно-оверлей (скрыто от записи экрана)
+# --------------------------------------------------------------------------
+class Overlay(QMainWindow):
+    sig_capture = pyqtSignal()
+    sig_toggle = pyqtSignal()
+    sig_quit = pyqtSignal()
+    sig_text = pyqtSignal(str, bool)  # (text, show_window)
+
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        self._build_ui()
+
+        self.sig_capture.connect(self._capture, Qt.ConnectionType.QueuedConnection)
+        self.sig_toggle.connect(self._toggle, Qt.ConnectionType.QueuedConnection)
+        self.sig_quit.connect(QApplication.quit, Qt.ConnectionType.QueuedConnection)
+        self.sig_text.connect(self._set_text, Qt.ConnectionType.QueuedConnection)
+
+        # глобальные хоткеи (отдельный поток pynput)
+        self.listener = keyboard.GlobalHotKeys({
+            "<shift>+a": lambda: self.sig_capture.emit(),
+            "<shift>+d": lambda: self.sig_toggle.emit(),
+            "<shift>+q": lambda: self.sig_quit.emit(),
+            # без модификаторов: «,» — скриншот, «.» — показать/скрыть окно
+            ",": lambda: self.sig_capture.emit(),
+            ".": lambda: self.sig_toggle.emit(),
+        })
+        self.listener.daemon = True
+        self.listener.start()
+        logger.info("✅ Хоткеи зарегистрированы: Shift+A / Shift+D / Shift+Q / , / .")
+        self._start_media_listener()
+        self._start_mouse_listener()
+
+        QTimer.singleShot(200, self._hide_from_capture)
+
+    # ---- Bluetooth-кнопки: «громкость −» — скриншот, «громкость +» — окно ----
+    def _start_media_listener(self):
+        self.media_blocker = MediaKeyBlocker(
+            on_down=lambda: self.sig_capture.emit(),
+            on_up=lambda: self.sig_toggle.emit(),
+        )
+        self.media_blocker.start()
+        logger.info("✅ Громкость −/+: скриншот / окно (звук не меняется)")
+
+    # ---- мышь: ПКМ — показать/скрыть, скролл вниз — скриншот ----
+    def _start_mouse_listener(self):
+        try:
+            import time
+            from pynput import mouse
+            last = {"scroll": 0.0, "click": 0.0}
+
+            def on_click(x, y, button, pressed):
+                if pressed and button == mouse.Button.right:
+                    now = time.time()
+                    if now - last["click"] > 0.3:
+                        last["click"] = now
+                        self.sig_toggle.emit()
+
+            def on_scroll(x, y, dx, dy):
+                if dy < 0:
+                    now = time.time()
+                    # скролл шлёт много событий подряд — один скриншот на жест
+                    if now - last["scroll"] > 1.5:
+                        self.sig_capture.emit()
+                    last["scroll"] = now
+
+            self._mouse = mouse.Listener(on_click=on_click, on_scroll=on_scroll)
+            self._mouse.daemon = True
+            self._mouse.start()
+            logger.info("✅ Мышь: ПКМ — окно, скролл вниз — скриншот")
+        except Exception as e:
+            logger.warning(f"⚠️ mouse listener: {e}")
+
+    # ---- UI ----
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        central = QWidget()
+        central.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;border-radius:12px;}"
+            "QScrollBar:vertical{background:transparent;width:6px;}"
+            "QScrollBar::handle:vertical{background:rgba(150,150,150,120);border-radius:3px;}"
+        )
+        self.text = QTextEdit("Готов. Shift+A — скриншот.")
+        self.text.setReadOnly(True)
+        self.text.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text.setStyleSheet(
+            "QTextEdit{background:transparent;color:#fff;padding:6px 2px 6px 2px;"
+            "font-size:14px;border:none;}"
+        )
+        f = QFont()
+        f.setFamilies(["Segoe UI", "Arial"])
+        f.setPointSize(11)
+        self.text.setFont(f)
+        # тёмный контур вокруг текста — читается на любом фоне
+        from PyQt6.QtWidgets import QGraphicsDropShadowEffect
+        from PyQt6.QtGui import QColor
+        shadow = QGraphicsDropShadowEffect(self.text)
+        shadow.setBlurRadius(6)
+        shadow.setOffset(0, 0)
+        shadow.setColor(QColor(0, 0, 0, 255))
+        self.text.setGraphicsEffect(shadow)
+        f.setWeight(QFont.Weight.DemiBold)
+        self.text.setFont(f)
+        scroll.setWidget(self.text)
+        layout.addWidget(scroll)
+        self.setCentralWidget(central)
+
+        screen = QApplication.primaryScreen().geometry()
+        # узкая полоска у правого края — справа от вебки
+        self.setMinimumWidth(0)
+        self.resize(40, 220)
+        self.move(screen.width() - 40, screen.height() - 220)
+
+    def _hide_from_capture(self):
+        """WDA_EXCLUDEFROMCAPTURE — окно не попадает в скриншоты и запись экрана."""
+        try:
+            hwnd = int(self.winId())
+            WDA_EXCLUDEFROMCAPTURE = 0x11
+            ok = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            if not ok:
+                logger.warning("⚠️ SetWindowDisplayAffinity вернул 0")
+        except Exception as e:
+            logger.warning(f"⚠️ hide_from_capture: {e}")
+
+    # ---- действия ----
+    def _capture(self):
+        if self.worker and self.worker.isRunning():
+            logger.warning("⚠️ Предыдущий запрос ещё идёт")
+            return
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
+            QApplication.processEvents()
+        QTimer.singleShot(120, lambda: self._do_capture())
+
+    def _do_capture(self):
+        try:
+            shot = ImageGrab.grab()
+            logger.info(f"📸 Скриншот {shot.size[0]}x{shot.size[1]}")
+            buf = io.BytesIO()
+            shot.save(buf, format="PNG")
+            data = buf.getvalue()
+            self._set_text("Анализирую...", False)
+            self.worker = ScreenshotWorker(data)
+            self.worker.finished.connect(self._on_response, Qt.ConnectionType.QueuedConnection)
+            self.worker.start()
+        except Exception as e:
+            logger.error(f"❌ Скриншот не удался: {e}")
+            self.sig_text.emit(f"❌ Не удалось снять экран: {e}", True)
+
+    def _on_response(self, result: dict):
+        # Окно само НЕ открывается — ответ готовится молча, смотреть по Shift+D.
+        if result.get("success"):
+            self.sig_text.emit(result.get('answer', '—'), False)
+            logger.info("✅ Ответ получен (Shift+D — показать)")
+        else:
+            self.sig_text.emit(f"❌ Ошибка: {result.get('error', '—')}", False)
+            logger.warning(f"⚠️ {result.get('error')}")
+
+    # ---- отрисовка текста ----
+    def _set_text(self, text: str, show_window: bool):
+        import re
+        html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text).replace("\n", "<br>")
+        self.text.setHtml(f'<div style="color:#fff;font-size:13px;font-weight:600;">{html}</div>')
+        if show_window:
+            self.show()
+            self.raise_()
+            self._hide_from_capture()
+
+    def _toggle(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+            self._hide_from_capture()
+
+    def closeEvent(self, event):
+        try:
+            self.listener.stop()
+            self._mouse.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    print("=" * 52)
+    print("🔒 Помощник (Windows) запущен")
+    print(f"🌐 Сервер: {SERVER_URL}")
+    print("   Shift+A — скриншот и анализ (также кнопка «громкость −»)")
+    print("   Shift+D — показать/скрыть ответ (также кнопка «громкость +»)")
+    print("   Shift+Q — выход")
+    print("=" * 52)
+    logger.info("🚀 Жду хоткеи...")
+
+    win = Overlay()
+    app._win = win
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

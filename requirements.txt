@@ -1,0 +1,19 @@
+# ===== КЛИЕНТ (client.py) =====
+PyQt6>=6.6.0
+pynput>=1.7.6
+Pillow>=10.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+# скрытие окна от записи экрана на macOS (ставится только на маке)
+pyobjc-framework-Cocoa>=10.0 ; sys_platform == "darwin"
+
+# ===== СЕРВЕР (server.py — Claude backend) =====
+fastapi>=0.109.0
+uvicorn>=0.27.0
+anthropic>=0.49.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+Pillow>=10.0.0
+
+# ===== СБОРКА .EXE / .app =====
+pyinstaller>=6.3.0
